@@ -66,20 +66,31 @@ def collect_files(mod_dirs, subdir, exts):
 
 # ----------------------------------------------------------------- localisation
 
+def read_loc_file(path, language):
+    """[(key, raw text), ...] in file order, or None if the file is another language."""
+    lines = read_text(path).splitlines()
+    first = next((l.strip() for l in lines if l.strip() and not l.strip().startswith('#')), '')
+    if first.split('#')[0].strip() != 'l_%s:' % language:
+        return None
+    return [m.groups() for m in map(LOC_LINE.match, lines) if m]
+
+
+def loc_files(mod_dirs):
+    """Localisation files of each folder; a folder without localisation/ is searched as is."""
+    files = collect_files(mod_dirs, 'localisation', ('.yml',))
+    for d in mod_dirs:
+        if not os.path.isdir(os.path.join(d, 'localisation')):
+            files.update(collect_files([d], '', ('.yml',)))
+    return files
+
+
 def load_localisation(mod_dirs, language):
     """Key -> raw text. Files under localisation/**/replace/ win over everything else."""
     loc, replace = {}, {}
-    header = 'l_%s:' % language
-    for rel, path in collect_files(mod_dirs, 'localisation', ('.yml',)).items():
-        lines = read_text(path).splitlines()
-        first = next((l.strip() for l in lines if l.strip() and not l.strip().startswith('#')), '')
-        if first.split('#')[0].strip() != header:
-            continue
-        target = replace if '/replace/' in rel else loc
-        for line in lines:
-            m = LOC_LINE.match(line)
-            if m:
-                target[m.group(1)] = m.group(2)
+    for rel, path in loc_files(mod_dirs).items():
+        entries = read_loc_file(path, language)
+        if entries:
+            (replace if '/replace/' in '/' + rel else loc).update(entries)
     loc.update(replace)
     return loc
 
@@ -89,8 +100,8 @@ def clean(text, keep_codes=False):
         return None
     text = text.replace('\\n', '\n').replace('\\"', '"')
     if not keep_codes:
-        text = re.sub(r'§[A-Za-z0-9!]', '', text)        # colour codes
-        text = re.sub(r'£[^\s£|]+(\|\d+)?', '', text)     # icons
+        text = re.sub(r'§[A-Za-z0-9!]', '', text)          # colour codes
+        text = re.sub(r'£[^\s£|]+(\|\d+)?£?', '', text)     # icons, incl. £GFX_banner£
     return text.strip()
 
 
@@ -320,6 +331,79 @@ def pick_categories(categories, args):
     return categories
 
 
+def walk(items):
+    for k, v in items:
+        yield k, v
+        if isinstance(v, list):
+            yield from walk(v)
+
+
+def event_refs(items):
+    """Event ids fired from a block: ``country_event = x.1`` or ``country_event = { id = x.1 }``."""
+    refs = []
+    for k, v in walk(items):
+        if k in EVENT_TYPES:
+            eid = get(v, 'id') if isinstance(v, list) else v
+            if isinstance(eid, str):
+                refs.append(eid)
+    return refs
+
+
+def idea_refs(items):
+    refs = []
+    for k, v in walk(items):
+        if k in ('add_ideas', 'add_idea', 'idea'):
+            if isinstance(v, str):
+                refs.append(v)
+            elif isinstance(v, list):
+                refs.extend(x for kk, x in v if kk is None and isinstance(x, str))
+    return refs
+
+
+def mentions_any(items, keys, values):
+    return any(k in keys and v in values for k, v in walk(items))
+
+
+def follow(trees, events, categories, ideas):
+    """Everything the picked focus trees lead to: events they fire (and the events
+    those fire), events/decisions gated on their focuses, and spirits they grant.
+
+    Shared focuses are the common trunk every route passes through, so they are not
+    followed; otherwise one route would drag in every other route's content.
+    """
+    own = [t for t in trees if not t['id'].startswith(SHARED)]
+    focus_ids = {get(f, 'id') for t in own for f in t['focuses']}
+    focus_bodies = [f for t in own for f in t['focuses']]
+    gate = ('has_completed_focus', 'focus')
+
+    picked_cats = []
+    for c in categories:
+        if mentions_any(c['body'], gate, focus_ids) or any(mentions(b, c['id']) for b in focus_bodies):
+            picked_cats.append(c)
+            continue
+        hits = [d for d in c['decisions'] if mentions_any(get(c['body'], d, []), gate, focus_ids)]
+        if hits:
+            picked_cats.append(dict(c, decisions=hits))
+    decision_bodies = [get(c['body'], d, []) for c in picked_cats for d in c['decisions']]
+
+    by_id = {e['id']: e for e in events}
+    queue = [r for b in focus_bodies + decision_bodies for r in event_refs(b)]
+    queue += [e['id'] for e in events if mentions_any(e['body'], gate, focus_ids)]
+    seen = set()
+    while queue:
+        eid = queue.pop()
+        if eid in seen or eid not in by_id:
+            continue
+        seen.add(eid)
+        queue.extend(event_refs(by_id[eid]['body']))
+    picked_events = [e for e in events if e['id'] in seen]
+
+    wanted_ideas = {r for b in focus_bodies + decision_bodies + [e['body'] for e in picked_events]
+                    for r in idea_refs(b)}
+    picked_ideas = [i for i in ideas if i['id'] in wanted_ideas]
+    return picked_events, picked_cats, picked_ideas
+
+
 def pick_ideas(ideas, args):
     if args.tag:
         tag = args.tag.lower()
@@ -354,6 +438,8 @@ class Writer:
         self.lines.append(line)
 
     def entry(self, title, key, paragraphs=(), bullets=()):
+        if self.lines and self.lines[-1].startswith('- '):
+            self.add()
         self.add('### %s  `%s`\n' % (title or key, key))
         for p in paragraphs:
             self.add(quote(p) + '\n')
@@ -363,11 +449,42 @@ class Writer:
             self.add()
 
 
-def write_focuses(w, trees):
+def to_int(value):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def tree_order(focuses):
+    """Sort focuses top-to-bottom, left-to-right as laid out in game
+    (x/y are relative to ``relative_position_id`` when it is set)."""
+    by_id = {get(f, 'id'): f for f in focuses}
+    cache = {}
+
+    def pos(fid, depth=0):
+        if fid in cache:
+            return cache[fid]
+        f = by_id.get(fid)
+        if f is None or depth > 50:
+            return 0, 0
+        x, y = to_int(get(f, 'x')), to_int(get(f, 'y'))
+        parent = get(f, 'relative_position_id')
+        if isinstance(parent, str) and parent in by_id:
+            px, py = pos(parent, depth + 1)
+            x, y = x + px, y + py
+        cache[fid] = (x, y)
+        return x, y
+
+    return sorted(focuses, key=lambda f: (pos(get(f, 'id'))[1], pos(get(f, 'id'))[0]))
+
+
+def write_focuses(w, trees, order='tree'):
     w.add('# 国策 National focuses\n')
     for tree in trees:
         entries = []
-        for f in tree['focuses']:
+        focuses = tree_order(tree['focuses']) if order == 'tree' else tree['focuses']
+        for f in focuses:
             fid = get(f, 'id')
             if not isinstance(fid, str):
                 continue
@@ -433,6 +550,61 @@ def write_ideas(w, ideas):
             w.data.append({'kind': 'idea', 'id': idea['id'], 'name': name, 'desc': desc})
 
 
+EVENT_KEY = re.compile(r'^([A-Za-z_][\w]*\.\d+)\.(\w+)$')
+
+
+def write_loc_only(w, files, language, file_filters):
+    """Render localisation files on their own, in file order: ``X`` + ``X_desc`` as one
+    entry, ``ns.N.t`` / ``.d`` / ``.a``... as one event, anything else as a line."""
+    for rel, path in files.items():
+        if file_filters and not like(rel, file_filters):
+            continue
+        entries = read_loc_file(path, language)
+        if not entries:
+            continue
+        keys = OrderedDict(entries)
+        blocks, events, used = [], OrderedDict(), set()
+        for key in keys:
+            m = EVENT_KEY.match(key)
+            if m:
+                ev = events.setdefault(m.group(1), {'t': [], 'd': [], 'o': []})
+                part = m.group(2)
+                slot = 't' if part in ('t', 'title') else 'd' if part.startswith('d') else 'o'
+                if not ev['t'] and not ev['d'] and not ev['o']:
+                    blocks.append(('event', m.group(1)))
+                ev[slot].append(key)
+            elif key.endswith('_desc') and key[:-5] in keys:
+                continue
+            else:
+                blocks.append(('pair', key))
+        lines_before, entries_before = len(w.lines), len(w.data)
+        w.add('## %s\n' % rel)
+        for kind, key in blocks:
+            if kind == 'event':
+                ev = events[key]
+                titles = [x for x in map(w.t, ev['t']) if x]
+                descs = [x for x in map(w.t, ev['d']) if x]
+                options = [x for x in map(w.t, ev['o']) if x]
+                if (titles or descs or options) and w.wanted(key, *(titles + descs + options)):
+                    w.entry(' / '.join(titles), key, descs, ['选项：' + o for o in options])
+                    w.data.append({'kind': 'event', 'id': key, 'title': titles, 'desc': descs, 'options': options})
+            else:
+                name, desc = w.t(key), w.t(key + '_desc')
+                if not (name or desc) or not w.wanted(key, name, desc):
+                    continue
+                if desc:
+                    w.entry(name, key, [desc])
+                elif '\n' in name or len(name) > 60:
+                    w.entry(None, key, [name])
+                else:
+                    w.add('- `%s` %s' % (key, name))
+                w.data.append({'kind': 'loc', 'id': key, 'name': name, 'desc': desc})
+        if len(w.data) == entries_before:
+            del w.lines[lines_before:]
+        else:
+            w.add()
+
+
 def print_overview(trees, events, categories, loc):
     print('Localisation keys loaded: %d' % len(loc))
     print('\nFocus trees  (id | country tags | focuses | file)')
@@ -459,10 +631,19 @@ def main(argv=None):
     p.add_argument('--tree', action='append', default=[], help='focus trees whose id/file contains this (repeatable)')
     p.add_argument('--namespace', action='append', default=[], help='event namespaces whose name/file contains this (repeatable)')
     p.add_argument('--category', action='append', default=[], help='decision categories whose id/file contains this (repeatable)')
+    p.add_argument('--event', action='append', default=[], help='also include this exact event id, e.g. china.2000 (repeatable)')
     p.add_argument('--keyword', action='append', default=[], help='only entries whose text or id contains this (repeatable, any match)')
     p.add_argument('--only', choices=['focus', 'event', 'decision', 'idea'], action='append', help='limit to these sections (repeatable)')
     p.add_argument('--keep-codes', action='store_true', help='keep §Y colour codes and £icons')
+    p.add_argument('--order', choices=['tree', 'file'], default='tree',
+                   help='focus order: as laid out in the tree (default) or as written in the file')
+    p.add_argument('--follow', action='store_true',
+                   help='with --tree/--tag: also take the events, decisions and spirits those focus trees lead to')
     p.add_argument('--list', action='store_true', help='print focus trees / event namespaces / decision categories and exit')
+    p.add_argument('--loc-only', action='store_true',
+                   help='skip the scripts and print localisation files as they are (for text-only mods)')
+    p.add_argument('--file', action='append', default=[],
+                   help='with --loc-only: only localisation files whose path contains this (repeatable)')
     p.add_argument('-o', '--output', help='write Markdown to this file (default: stdout)')
     p.add_argument('--json', help='also write the entries as JSON to this file')
     args = p.parse_args(argv)
@@ -474,6 +655,10 @@ def main(argv=None):
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
     loc = load_localisation(args.mod_dirs, args.language)
+    if args.loc_only:
+        w = Writer(loc, args.keep_codes, args.keyword)
+        write_loc_only(w, loc_files(args.mod_dirs), args.language, args.file)
+        return finish(w, args)
     trees = extract_focus_trees(args.mod_dirs)
     events = extract_events(args.mod_dirs)
     categories = extract_decisions(args.mod_dirs)
@@ -481,14 +666,35 @@ def main(argv=None):
     if args.list:
         print_overview(trees, events, categories, loc)
         return 0
+    if args.follow and not (args.tree or args.tag):
+        p.error('--follow needs --tree or --tag')
+
+    ideas = extract_ideas(args.mod_dirs)
+    picked_trees = pick_trees(trees, args)
+    if args.follow:
+        picked_events, picked_cats, picked_ideas = follow(picked_trees, events, categories, ideas)
+        if args.namespace:
+            extra = {e['id'] for e in pick_events(events, args)}
+            picked_events = [e for e in events if e['id'] in extra or e in picked_events]
+        if args.category:
+            ids = {c['id'] for c in picked_cats}
+            picked_cats += [c for c in pick_categories(categories, args) if c['id'] not in ids]
+    else:
+        picked_events = pick_events(events, args)
+        picked_cats = pick_categories(categories, args)
+        picked_ideas = pick_ideas(ideas, args)
+
+    if args.event:
+        ids = {e['id'] for e in picked_events}
+        picked_events = picked_events + [e for e in events if e['id'] in args.event and e['id'] not in ids]
 
     sections = args.only or ['focus', 'event', 'decision', 'idea']
     w = Writer(loc, args.keep_codes, args.keyword)
     jobs = [
-        ('focus', lambda: write_focuses(w, pick_trees(trees, args))),
-        ('event', lambda: write_events(w, pick_events(events, args))),
-        ('decision', lambda: write_decisions(w, pick_categories(categories, args))),
-        ('idea', lambda: write_ideas(w, pick_ideas(extract_ideas(args.mod_dirs), args))),
+        ('focus', lambda: write_focuses(w, picked_trees, args.order)),
+        ('event', lambda: write_events(w, picked_events)),
+        ('decision', lambda: write_decisions(w, picked_cats)),
+        ('idea', lambda: write_ideas(w, picked_ideas)),
     ]
     for name, job in jobs:
         if name in sections:
@@ -496,7 +702,10 @@ def main(argv=None):
             job()
             if len(w.data) == entries_before:  # drop the empty section header
                 del w.lines[lines_before:]
+    return finish(w, args)
 
+
+def finish(w, args):
     out = '\n'.join(w.lines) + '\n'
     if args.output:
         with open(args.output, 'w', encoding='utf-8') as f:
